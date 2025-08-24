@@ -6,7 +6,6 @@ import uuid
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
@@ -35,6 +34,62 @@ except Exception:
 
 # ---- Groq LLM ----
 from groq import Groq
+
+# --- Medical spell-check (SymSpell) ---
+from symspellpy import SymSpell, Verbosity
+
+_SYMSPELL = None
+
+def _get_symspell():
+    """
+    Singleton SymSpell using your merged MeSH dictionary.
+    Set MEDICAL_VOCAB_PATH to point to medical_vocab_all.tsv (or the supp/desc TSV you want).
+    """
+    global _SYMSPELL
+    if _SYMSPELL is not None:
+        return _SYMSPELL
+
+    sym = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
+    vocab_path = os.getenv("MEDICAL_VOCAB_PATH", "medical_vocab_all.tsv")
+    if not os.path.exists(vocab_path):
+        # Fall back to local 'dicts' folder if you keep it there
+        alt = os.path.join("dicts", "medical_vocab_all.tsv")
+        if os.path.exists(alt):
+            vocab_path = alt
+        else:
+            # If dictionary not found, we still return an empty SymSpell (no-ops)
+            _SYMSPELL = sym
+            return _SYMSPELL
+
+    sym.load_dictionary(vocab_path, term_index=0, count_index=1, separator="\t")
+    _SYMSPELL = sym
+    return _SYMSPELL
+
+
+def medical_spell_correct(text: str) -> str:
+    """
+    Conservative token-wise correction for alphabetic tokens (>=3 chars).
+    Restores simple casing (Title/UPPER) after correction.
+    """
+    sym = _get_symspell()
+    tokens = re.split(r'(\W+)', text)  # keep separators (spaces, punctuation)
+    out = []
+    for tok in tokens:
+        tlo = tok.lower()
+        if (not tok) or (not tok.isalpha()) or (len(tok) < 3):
+            out.append(tok); continue
+
+        suggestions = sym.lookup(tlo, Verbosity.TOP, max_edit_distance=2, include_unknown=True)
+        cand = suggestions[0].term if suggestions else tlo
+
+        # restore casing
+        if tok.istitle():
+            cand = cand.title()
+        elif tok.isupper():
+            cand = cand.upper()
+
+        out.append(cand)
+    return "".join(out)
 
 
 # =========================================
@@ -386,7 +441,8 @@ class Chatbot:
 
     def respond(self, user_message: str):
         # Retrieve context using the user message
-        docs = self.vectorstore.retrieve(user_message) or []
+        corrected_query = medical_spell_correct(user_message)
+        docs = self.vectorstore.retrieve(corrected_query) or []
 
         # Flatten docs into a single context block
         context_blocks = []
